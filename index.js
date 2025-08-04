@@ -18,6 +18,12 @@ const MAX_HEIGHT = parseInt(process.env.MAX_HEIGHT || '3000');
 const MAX_CACHE_SIZE_MB = parseInt(process.env.MAX_CACHE_SIZE_MB || '1000'); // 1000MB default
 const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS || '10');
 
+// Memory optimization settings
+const BROWSER_IDLE_TIMEOUT = parseInt(process.env.BROWSER_IDLE_TIMEOUT || '120000'); // 2 minutes default
+const MEMORY_CACHE_TTL = parseInt(process.env.MEMORY_CACHE_TTL || '600'); // 10 minutes default (short for low memory)
+const MAX_MEMORY_CACHE_KEYS = parseInt(process.env.MAX_MEMORY_CACHE_KEYS || '20'); // Very limited for low memory
+const DISK_CACHE_MAX_AGE_DAYS = parseInt(process.env.DISK_CACHE_MAX_AGE_DAYS || '1'); // 1 day default
+
 // Concurrent request tracking
 let activeRequests = 0;
 
@@ -74,7 +80,12 @@ function isDomainAllowed(url) {
 
 // Cache configuration
 const CACHE_DIR = path.join(__dirname, 'cache');
-const memoryCache = new NodeCache({ stdTTL: 3600, checkperiod: 600 }); // 1-hour TTL, check every 10 minutes
+const memoryCache = new NodeCache({ 
+  stdTTL: MEMORY_CACHE_TTL, 
+  checkperiod: 300, // Check every 5 minutes
+  maxKeys: MAX_MEMORY_CACHE_KEYS,
+  deleteOnExpire: true
+});
 
 // Ensure cache directory exists
 if (!fs.existsSync(CACHE_DIR)) {
@@ -95,37 +106,50 @@ function getCacheFilePath(cacheKey) {
   return path.join(CACHE_DIR, `${cacheKey}.jpg`);
 }
 
-// Check if image exists in cache
+// Check if image exists in cache (prioritize disk cache)
 function getFromCache(url, width, height) {
   const cacheKey = generateCacheKey(url, width, height);
   
-  // Check memory cache first (faster)
-  const memCacheResult = memoryCache.get(cacheKey);
-  if (memCacheResult) {
-    return memCacheResult;
-  }
-  
-  // Then check file cache
+  // Check file cache first (more reliable for reducing browser usage)
   const filePath = getCacheFilePath(cacheKey);
   if (fs.existsSync(filePath)) {
     try {
       const stats = fs.statSync(filePath);
-      const fileBuffer = fs.readFileSync(filePath);
+      const now = Date.now();
+      const fileAge = now - stats.mtimeMs;
+      const maxAgeMs = DISK_CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
       
-      // Store in memory cache for faster access next time
-      memoryCache.set(cacheKey, fileBuffer);
-      
-      return fileBuffer;
+      // Only use disk cache if file is not too old
+      if (fileAge <= maxAgeMs) {
+        const fileBuffer = fs.readFileSync(filePath);
+        
+        // Only store in memory cache if we have room and it's frequently accessed
+        if (memoryCache.keys().length < MAX_MEMORY_CACHE_KEYS) {
+          memoryCache.set(cacheKey, fileBuffer);
+        }
+        
+        return fileBuffer;
+      } else {
+        // File is too old, delete it
+        fs.unlinkSync(filePath);
+        console.log(`🗑️ Deleted expired cache file: ${cacheKey}`);
+      }
     } catch (error) {
       console.error(`❌ Error reading from cache: ${error.message}`);
       return null;
     }
   }
   
+  // Check memory cache as fallback
+  const memCacheResult = memoryCache.get(cacheKey);
+  if (memCacheResult) {
+    return memCacheResult;
+  }
+  
   return null;
 }
 
-// Save image to cache
+// Save image to cache (prioritize disk cache for persistence)
 function saveToCache(url, width, height, imageBuffer) {
   const cacheKey = generateCacheKey(url, width, height);
   const filePath = getCacheFilePath(cacheKey);
@@ -133,11 +157,13 @@ function saveToCache(url, width, height, imageBuffer) {
   try {
     // Check cache size before saving new files
     if (!exceedsCacheSize(imageBuffer.length)) {
-      // Save to file cache
+      // Always save to file cache for persistence
       fs.writeFileSync(filePath, imageBuffer);
       
-      // Also save to memory cache
-      memoryCache.set(cacheKey, imageBuffer);
+      // Only save to memory cache if we have room (minimize memory usage)
+      if (memoryCache.keys().length < MAX_MEMORY_CACHE_KEYS) {
+        memoryCache.set(cacheKey, imageBuffer);
+      }
       
       console.log(`💖 Cached image for ${url}`);
       return true;
@@ -175,10 +201,10 @@ function exceedsCacheSize(newFileSizeBytes) {
   }
 }
 
-// Cleanup old cache files (older than 7 days)
+// Cleanup old cache files
 function cleanupCache(force = false) {
   const now = Date.now();
-  const maxAge = force ? 1 : 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds, or 1ms if forced
+  const maxAge = force ? 1 : DISK_CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000; // Configurable days in milliseconds, or 1ms if forced
   
   try {
     const files = fs.readdirSync(CACHE_DIR);
@@ -220,6 +246,7 @@ function cleanupCache(force = false) {
 let browser = null;
 let browserQueue = [];
 let isBrowserInitializing = false;
+let browserIdleTimer = null;
 
 // Initialize browser when needed
 async function initBrowser() {
@@ -256,12 +283,27 @@ async function initBrowser() {
   }
 }
 
-// Close browser when queue is empty
+// Close browser when queue is empty with idle timeout
 async function closeBrowserIfQueueEmpty() {
   if (browserQueue.length === 0 && browser) {
-    await browser.close();
-    browser = null;
-    console.log('✨ Browser closed, queue is empty!');
+    // Clear any existing timer
+    if (browserIdleTimer) {
+      clearTimeout(browserIdleTimer);
+    }
+    
+    // Set timer to close browser after idle timeout
+    browserIdleTimer = setTimeout(async () => {
+      if (browserQueue.length === 0 && browser && !isShuttingDown) {
+        try {
+          await browser.close();
+          browser = null;
+          browserIdleTimer = null;
+          console.log('✨ Browser closed after idle timeout!');
+        } catch (error) {
+          console.error('❌ Error closing idle browser:', error.message);
+        }
+      }
+    }, BROWSER_IDLE_TIMEOUT);
   }
 }
 
@@ -280,6 +322,12 @@ async function processNextRequest() {
   if (browserQueue.length === 0 || isShuttingDown) {
     await closeBrowserIfQueueEmpty();
     return;
+  }
+  
+  // Clear idle timer since we're processing a request
+  if (browserIdleTimer) {
+    clearTimeout(browserIdleTimer);
+    browserIdleTimer = null;
   }
 
   const { targetUrl, parsedWidth, parsedHeight, res } = browserQueue[0];
@@ -390,6 +438,12 @@ async function gracefulShutdown(signal) {
   try {
     // Clear the browser queue to prevent new requests
     browserQueue.length = 0;
+    
+    // Clear browser idle timer
+    if (browserIdleTimer) {
+      clearTimeout(browserIdleTimer);
+      browserIdleTimer = null;
+    }
     
     // Close browser if it exists
     if (browser) {
@@ -635,6 +689,10 @@ app.listen(PORT, async () => {
   console.log(`  - Max height: ${MAX_HEIGHT}px`);
   console.log(`  - Max cache size: ${MAX_CACHE_SIZE_MB}MB`);
   console.log(`  - Max concurrent requests: ${MAX_CONCURRENT_REQUESTS}`);
+  console.log(`  - Browser idle timeout: ${BROWSER_IDLE_TIMEOUT / 1000}s`);
+  console.log(`  - Memory cache TTL: ${MEMORY_CACHE_TTL}s`);
+  console.log(`  - Max memory cache keys: ${MAX_MEMORY_CACHE_KEYS}`);
+  console.log(`  - Disk cache max age: ${DISK_CACHE_MAX_AGE_DAYS} days`);
   
   // Log whitelist status
   if (WHITELIST_ENABLED) {
