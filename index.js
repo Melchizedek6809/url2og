@@ -2,9 +2,11 @@
 
 import express from 'express';
 import puppeteer from 'puppeteer';
+import dns from 'dns/promises';
 import fs from 'fs';
+import net from 'net';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import crypto from 'crypto';
 import NodeCache from 'node-cache';
 
@@ -33,6 +35,103 @@ const ALLOWED_DOMAINS = process.env.ALLOWED_DOMAINS
   : [];
 
 const WHITELIST_ENABLED = ALLOWED_DOMAINS.length > 0;
+
+function normalizeHostname(hostname) {
+  return hostname
+    .toLowerCase()
+    .replace(/^\[(.*)\]$/, '$1')
+    .replace(/\.$/, '');
+}
+
+function isBlockedIpv4Address(address) {
+  const octets = address.split('.').map(part => Number(part));
+  if (octets.length !== 4 || octets.some(part => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return true;
+  }
+
+  const [first, second] = octets;
+  return (
+    first === 0 ||
+    first === 10 ||
+    first === 127 ||
+    first >= 224 ||
+    (first === 100 && second >= 64 && second <= 127) ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 0) ||
+    (first === 192 && second === 168) ||
+    (first === 198 && (second === 18 || second === 19)) ||
+    (first === 255 && second === 255)
+  );
+}
+
+function isBlockedIpv6Address(address) {
+  const normalized = normalizeHostname(address);
+  const mappedIpv4 = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mappedIpv4) {
+    return isBlockedIpv4Address(mappedIpv4[1]);
+  }
+
+  if (normalized === '::' || normalized === '::1' || normalized === '0:0:0:0:0:0:0:1') {
+    return true;
+  }
+
+  const firstHextet = Number.parseInt(normalized.split(':')[0] || '0', 16);
+  return (
+    firstHextet === 0 ||
+    firstHextet === 0x100 ||
+    (firstHextet >= 0xfc00 && firstHextet <= 0xfdff) ||
+    (firstHextet >= 0xfe80 && firstHextet <= 0xfebf) ||
+    (firstHextet >= 0xff00 && firstHextet <= 0xffff)
+  );
+}
+
+export function isBlockedIpAddress(address) {
+  const normalized = normalizeHostname(address);
+  const ipVersion = net.isIP(normalized);
+
+  if (ipVersion === 4) {
+    return isBlockedIpv4Address(normalized);
+  }
+
+  if (ipVersion === 6) {
+    return isBlockedIpv6Address(normalized);
+  }
+
+  return true;
+}
+
+export function normalizeScreenshotUrl(inputUrl) {
+  if (typeof inputUrl !== 'string' || inputUrl.trim() === '') {
+    throw new Error('URL is required');
+  }
+
+  if (/[\u0000-\u001F\u007F-\u009F]/.test(inputUrl) || inputUrl.length > 2000) {
+    throw new Error('Invalid URL');
+  }
+
+  const urlWithProtocol = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(inputUrl)
+    ? inputUrl
+    : `https://${inputUrl}`;
+
+  const parsedUrl = new URL(urlWithProtocol);
+
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    throw new Error('Unsupported URL protocol');
+  }
+
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error('URL credentials are not allowed');
+  }
+
+  parsedUrl.searchParams.set('URL2OG', '1');
+
+  if (parsedUrl.href.length > 2000) {
+    throw new Error('URL is too long');
+  }
+
+  return parsedUrl;
+}
 
 // Add security headers middleware
 app.use((req, res, next) => {
@@ -76,6 +175,38 @@ function isDomainAllowed(url) {
     console.error(`❌ Error parsing URL: ${error.message}`);
     return false;
   }
+}
+
+async function isPrivateNetworkUrl(url) {
+  const urlObj = url instanceof URL ? url : new URL(url);
+  const hostname = normalizeHostname(urlObj.hostname);
+
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+    return true;
+  }
+
+  if (net.isIP(hostname)) {
+    return isBlockedIpAddress(hostname);
+  }
+
+  const addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+  return addresses.some(({ address }) => isBlockedIpAddress(address));
+}
+
+async function isSafeBrowserRequestUrl(requestUrl) {
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(requestUrl);
+  } catch (error) {
+    return false;
+  }
+
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    return true;
+  }
+
+  return !(await isPrivateNetworkUrl(parsedUrl));
 }
 
 // Cache configuration
@@ -349,9 +480,19 @@ async function processNextRequest() {
       
       // Block unnecessary resources to improve performance and security
       await page.setRequestInterception(true);
-      page.on('request', (req) => {
+      page.on('request', async (req) => {
         // Abort all requests if shutting down
         if (isShuttingDown) {
+          req.abort();
+          return;
+        }
+
+        try {
+          if (!(await isSafeBrowserRequestUrl(req.url()))) {
+            req.abort();
+            return;
+          }
+        } catch (error) {
           req.abort();
           return;
         }
@@ -594,23 +735,16 @@ app.get('/', async (req, res) => {
   if (parsedWidth > MAX_WIDTH) parsedWidth = MAX_WIDTH;
   if (parsedHeight > MAX_HEIGHT) parsedHeight = MAX_HEIGHT;
   
-  // Validate URL 
-  let targetUrl = url;
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
-    targetUrl = `https://${url}`;
-  }
-  
-  // Add URL2OG=1 parameter to the URL
-  targetUrl += targetUrl.includes('?') ? '&URL2OG=1' : '?URL2OG=1';
-  
-  // Additional URL validation - reject URLs with control characters or very long URLs
-  if (/[\u0000-\u001F\u007F-\u009F]/.test(targetUrl) || targetUrl.length > 2000) {
+  let targetUrl;
+  try {
+    targetUrl = normalizeScreenshotUrl(url);
+  } catch (error) {
     return res.status(400).send('Invalid URL');
   }
   
   // Check if domain is allowed
-  if (!isDomainAllowed(targetUrl)) {
-    console.error(`🚫 Blocked request for non-whitelisted domain: ${targetUrl}`);
+  if (!isDomainAllowed(targetUrl.href)) {
+    console.error(`🚫 Blocked request for non-whitelisted domain: ${targetUrl.href}`);
     return res.status(403).send(`
       <html>
         <head>
@@ -646,6 +780,18 @@ app.get('/', async (req, res) => {
       </html>
     `);
   }
+
+  try {
+    if (await isPrivateNetworkUrl(targetUrl)) {
+      console.error(`🚫 Blocked request for internal/private URL: ${targetUrl.href}`);
+      return res.status(403).send('Forbidden URL');
+    }
+  } catch (error) {
+    console.error(`❌ Error validating URL target: ${error.message}`);
+    return res.status(400).send('Invalid URL');
+  }
+
+  targetUrl = targetUrl.href;
   
   try {
     // Check cache first
@@ -676,30 +822,36 @@ app.get('/health', (req, res) => {
 });
 
 // Start the server
-app.listen(PORT, async () => {
-  // Set up automatic cache cleanup every 24 hours
-  setInterval(() => {
-    console.log('🧹 Running scheduled cache cleanup...');
-    cleanupCache();
-  }, 24 * 60 * 60 * 1000); // 24 hours
-  
-  console.log(`(●ﾟωﾟ●) Server is running at http://localhost:${PORT}`);
-  console.log(`⚙️ Configuration:`);
-  console.log(`  - Max width: ${MAX_WIDTH}px`);
-  console.log(`  - Max height: ${MAX_HEIGHT}px`);
-  console.log(`  - Max cache size: ${MAX_CACHE_SIZE_MB}MB`);
-  console.log(`  - Max concurrent requests: ${MAX_CONCURRENT_REQUESTS}`);
-  console.log(`  - Browser idle timeout: ${BROWSER_IDLE_TIMEOUT / 1000}s`);
-  console.log(`  - Memory cache TTL: ${MEMORY_CACHE_TTL}s`);
-  console.log(`  - Max memory cache keys: ${MAX_MEMORY_CACHE_KEYS}`);
-  console.log(`  - Disk cache max age: ${DISK_CACHE_MAX_AGE_DAYS} days`);
-  
-  // Log whitelist status
-  if (WHITELIST_ENABLED) {
-    console.log(`🔒 Domain whitelist enabled with ${ALLOWED_DOMAINS.length} domains:`);
-    ALLOWED_DOMAINS.forEach(domain => console.log(`  - ${domain}`));
-  } else {
-    console.log(`⚠️ No domain whitelist configured. Any domain is allowed.`);
-    console.log(`   Set ALLOWED_DOMAINS environment variable to restrict access.`);
-  }
-}); 
+export function startServer() {
+  return app.listen(PORT, async () => {
+    // Set up automatic cache cleanup every 24 hours
+    setInterval(() => {
+      console.log('🧹 Running scheduled cache cleanup...');
+      cleanupCache();
+    }, 24 * 60 * 60 * 1000); // 24 hours
+    
+    console.log(`(●ﾟωﾟ●) Server is running at http://localhost:${PORT}`);
+    console.log(`⚙️ Configuration:`);
+    console.log(`  - Max width: ${MAX_WIDTH}px`);
+    console.log(`  - Max height: ${MAX_HEIGHT}px`);
+    console.log(`  - Max cache size: ${MAX_CACHE_SIZE_MB}MB`);
+    console.log(`  - Max concurrent requests: ${MAX_CONCURRENT_REQUESTS}`);
+    console.log(`  - Browser idle timeout: ${BROWSER_IDLE_TIMEOUT / 1000}s`);
+    console.log(`  - Memory cache TTL: ${MEMORY_CACHE_TTL}s`);
+    console.log(`  - Max memory cache keys: ${MAX_MEMORY_CACHE_KEYS}`);
+    console.log(`  - Disk cache max age: ${DISK_CACHE_MAX_AGE_DAYS} days`);
+    
+    // Log whitelist status
+    if (WHITELIST_ENABLED) {
+      console.log(`🔒 Domain whitelist enabled with ${ALLOWED_DOMAINS.length} domains:`);
+      ALLOWED_DOMAINS.forEach(domain => console.log(`  - ${domain}`));
+    } else {
+      console.log(`⚠️ No domain whitelist configured. Any domain is allowed.`);
+      console.log(`   Set ALLOWED_DOMAINS environment variable to restrict access.`);
+    }
+  });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startServer();
+}
